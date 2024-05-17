@@ -15,16 +15,21 @@
 package server
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
-
-	"github.com/fatedier/frp/g"
-	"github.com/fatedier/frp/models/config"
-	"github.com/fatedier/frp/models/consts"
-	"github.com/fatedier/frp/utils/log"
-	"github.com/fatedier/frp/utils/version"
+	"slices"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/fatedier/frp/pkg/config/types"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/metrics/mem"
+	httppkg "github.com/fatedier/frp/pkg/util/http"
+	"github.com/fatedier/frp/pkg/util/log"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
+	"github.com/fatedier/frp/pkg/util/version"
 )
 
 type GeneralResponse struct {
@@ -32,50 +37,89 @@ type GeneralResponse struct {
 	Msg  string
 }
 
-type ServerInfoResp struct {
-	Version           string `json:"version"`
-	BindPort          int    `json:"bind_port"`
-	BindUdpPort       int    `json:"bind_udp_port"`
-	VhostHttpPort     int    `json:"vhost_http_port"`
-	VhostHttpsPort    int    `json:"vhost_https_port"`
-	KcpBindPort       int    `json:"kcp_bind_port"`
-	SubdomainHost     string `json:"subdomain_host"`
-	MaxPoolCount      int64  `json:"max_pool_count"`
-	MaxPortsPerClient int64  `json:"max_ports_per_client"`
-	HeartBeatTimeout  int64  `json:"heart_beat_timeout"`
+func (svr *Service) registerRouteHandlers(helper *httppkg.RouterRegisterHelper) {
+	helper.Router.HandleFunc("/healthz", svr.healthz)
+	subRouter := helper.Router.NewRoute().Subrouter()
 
-	TotalTrafficIn  int64            `json:"total_traffic_in"`
-	TotalTrafficOut int64            `json:"total_traffic_out"`
-	CurConns        int64            `json:"cur_conns"`
-	ClientCounts    int64            `json:"client_counts"`
-	ProxyTypeCounts map[string]int64 `json:"proxy_type_count"`
+	subRouter.Use(helper.AuthMiddleware.Middleware)
+
+	// metrics
+	if svr.cfg.EnablePrometheus {
+		subRouter.Handle("/metrics", promhttp.Handler())
+	}
+
+	// apis
+	subRouter.HandleFunc("/api/serverinfo", svr.apiServerInfo).Methods("GET")
+	subRouter.HandleFunc("/api/proxy/{type}", svr.apiProxyByType).Methods("GET")
+	subRouter.HandleFunc("/api/proxy/{type}/{name}", svr.apiProxyByTypeAndName).Methods("GET")
+	subRouter.HandleFunc("/api/traffic/{name}", svr.apiProxyTraffic).Methods("GET")
+	subRouter.HandleFunc("/api/proxies", svr.deleteProxies).Methods("DELETE")
+
+	// view
+	subRouter.Handle("/favicon.ico", http.FileServer(helper.AssetsFS)).Methods("GET")
+	subRouter.PathPrefix("/static/").Handler(
+		netpkg.MakeHTTPGzipHandler(http.StripPrefix("/static/", http.FileServer(helper.AssetsFS))),
+	).Methods("GET")
+
+	subRouter.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/static/", http.StatusMovedPermanently)
+	})
 }
 
-// api/serverinfo
-func (svr *Service) ApiServerInfo(w http.ResponseWriter, r *http.Request) {
+type serverInfoResp struct {
+	Version               string `json:"version"`
+	BindPort              int    `json:"bindPort"`
+	VhostHTTPPort         int    `json:"vhostHTTPPort"`
+	VhostHTTPSPort        int    `json:"vhostHTTPSPort"`
+	TCPMuxHTTPConnectPort int    `json:"tcpmuxHTTPConnectPort"`
+	KCPBindPort           int    `json:"kcpBindPort"`
+	QUICBindPort          int    `json:"quicBindPort"`
+	SubdomainHost         string `json:"subdomainHost"`
+	MaxPoolCount          int64  `json:"maxPoolCount"`
+	MaxPortsPerClient     int64  `json:"maxPortsPerClient"`
+	HeartBeatTimeout      int64  `json:"heartbeatTimeout"`
+	AllowPortsStr         string `json:"allowPortsStr,omitempty"`
+	TLSForce              bool   `json:"tlsForce,omitempty"`
+
+	TotalTrafficIn  int64            `json:"totalTrafficIn"`
+	TotalTrafficOut int64            `json:"totalTrafficOut"`
+	CurConns        int64            `json:"curConns"`
+	ClientCounts    int64            `json:"clientCounts"`
+	ProxyTypeCounts map[string]int64 `json:"proxyTypeCount"`
+}
+
+// /healthz
+func (svr *Service) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(200)
+}
+
+// /api/serverinfo
+func (svr *Service) apiServerInfo(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
 	defer func() {
-		log.Info("Http response [%s]: code [%d]", r.URL.Path, res.Code)
+		log.Infof("Http response [%s]: code [%d]", r.URL.Path, res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
-			w.Write([]byte(res.Msg))
+			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
 
-	log.Info("Http request: [%s]", r.URL.Path)
-	cfg := &g.GlbServerCfg.ServerCommonConf
-	serverStats := svr.statsCollector.GetServer()
-	svrResp := ServerInfoResp{
-		Version:           version.Full(),
-		BindPort:          cfg.BindPort,
-		BindUdpPort:       cfg.BindUdpPort,
-		VhostHttpPort:     cfg.VhostHttpPort,
-		VhostHttpsPort:    cfg.VhostHttpsPort,
-		KcpBindPort:       cfg.KcpBindPort,
-		SubdomainHost:     cfg.SubDomainHost,
-		MaxPoolCount:      cfg.MaxPoolCount,
-		MaxPortsPerClient: cfg.MaxPortsPerClient,
-		HeartBeatTimeout:  cfg.HeartBeatTimeout,
+	log.Infof("Http request: [%s]", r.URL.Path)
+	serverStats := mem.StatsCollector.GetServer()
+	svrResp := serverInfoResp{
+		Version:               version.Full(),
+		BindPort:              svr.cfg.BindPort,
+		VhostHTTPPort:         svr.cfg.VhostHTTPPort,
+		VhostHTTPSPort:        svr.cfg.VhostHTTPSPort,
+		TCPMuxHTTPConnectPort: svr.cfg.TCPMuxHTTPConnectPort,
+		KCPBindPort:           svr.cfg.KCPBindPort,
+		QUICBindPort:          svr.cfg.QUICBindPort,
+		SubdomainHost:         svr.cfg.SubDomainHost,
+		MaxPoolCount:          svr.cfg.Transport.MaxPoolCount,
+		MaxPortsPerClient:     svr.cfg.MaxPortsPerClient,
+		HeartBeatTimeout:      svr.cfg.Transport.HeartbeatTimeout,
+		AllowPortsStr:         types.PortsRangeSlice(svr.cfg.AllowPorts).String(),
+		TLSForce:              svr.cfg.Transport.TLS.Force,
 
 		TotalTrafficIn:  serverStats.TotalTrafficIn,
 		TotalTrafficOut: serverStats.TotalTrafficOut,
@@ -89,53 +133,62 @@ func (svr *Service) ApiServerInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 type BaseOutConf struct {
-	config.BaseProxyConf
+	v1.ProxyBaseConfig
 }
 
-type TcpOutConf struct {
+type TCPOutConf struct {
 	BaseOutConf
-	RemotePort int `json:"remote_port"`
+	RemotePort int `json:"remotePort"`
 }
 
-type UdpOutConf struct {
+type TCPMuxOutConf struct {
 	BaseOutConf
-	RemotePort int `json:"remote_port"`
+	v1.DomainConfig
+	Multiplexer     string `json:"multiplexer"`
+	RouteByHTTPUser string `json:"routeByHTTPUser"`
 }
 
-type HttpOutConf struct {
+type UDPOutConf struct {
 	BaseOutConf
-	config.DomainConf
+	RemotePort int `json:"remotePort"`
+}
+
+type HTTPOutConf struct {
+	BaseOutConf
+	v1.DomainConfig
 	Locations         []string `json:"locations"`
-	HostHeaderRewrite string   `json:"host_header_rewrite"`
+	HostHeaderRewrite string   `json:"hostHeaderRewrite"`
 }
 
-type HttpsOutConf struct {
+type HTTPSOutConf struct {
 	BaseOutConf
-	config.DomainConf
+	v1.DomainConfig
 }
 
-type StcpOutConf struct {
-	BaseOutConf
-}
-
-type XtcpOutConf struct {
+type STCPOutConf struct {
 	BaseOutConf
 }
 
-func getConfByType(proxyType string) interface{} {
-	switch proxyType {
-	case consts.TcpProxy:
-		return &TcpOutConf{}
-	case consts.UdpProxy:
-		return &UdpOutConf{}
-	case consts.HttpProxy:
-		return &HttpOutConf{}
-	case consts.HttpsProxy:
-		return &HttpsOutConf{}
-	case consts.StcpProxy:
-		return &StcpOutConf{}
-	case consts.XtcpProxy:
-		return &XtcpOutConf{}
+type XTCPOutConf struct {
+	BaseOutConf
+}
+
+func getConfByType(proxyType string) any {
+	switch v1.ProxyType(proxyType) {
+	case v1.ProxyTypeTCP:
+		return &TCPOutConf{}
+	case v1.ProxyTypeTCPMUX:
+		return &TCPMuxOutConf{}
+	case v1.ProxyTypeUDP:
+		return &UDPOutConf{}
+	case v1.ProxyTypeHTTP:
+		return &HTTPOutConf{}
+	case v1.ProxyTypeHTTPS:
+		return &HTTPSOutConf{}
+	case v1.ProxyTypeSTCP:
+		return &STCPOutConf{}
+	case v1.ProxyTypeXTCP:
+		return &XTCPOutConf{}
 	default:
 		return nil
 	}
@@ -145,11 +198,12 @@ func getConfByType(proxyType string) interface{} {
 type ProxyStatsInfo struct {
 	Name            string      `json:"name"`
 	Conf            interface{} `json:"conf"`
-	TodayTrafficIn  int64       `json:"today_traffic_in"`
-	TodayTrafficOut int64       `json:"today_traffic_out"`
-	CurConns        int64       `json:"cur_conns"`
-	LastStartTime   string      `json:"last_start_time"`
-	LastCloseTime   string      `json:"last_close_time"`
+	ClientVersion   string      `json:"clientVersion,omitempty"`
+	TodayTrafficIn  int64       `json:"todayTrafficIn"`
+	TodayTrafficOut int64       `json:"todayTrafficOut"`
+	CurConns        int64       `json:"curConns"`
+	LastStartTime   string      `json:"lastStartTime"`
+	LastCloseTime   string      `json:"lastCloseTime"`
 	Status          string      `json:"status"`
 }
 
@@ -157,47 +211,53 @@ type GetProxyInfoResp struct {
 	Proxies []*ProxyStatsInfo `json:"proxies"`
 }
 
-// api/proxy/:type
-func (svr *Service) ApiProxyByType(w http.ResponseWriter, r *http.Request) {
+// /api/proxy/:type
+func (svr *Service) apiProxyByType(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
 	params := mux.Vars(r)
 	proxyType := params["type"]
 
 	defer func() {
-		log.Info("Http response [%s]: code [%d]", r.URL.Path, res.Code)
+		log.Infof("Http response [%s]: code [%d]", r.URL.Path, res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
-			w.Write([]byte(res.Msg))
+			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
-	log.Info("Http request: [%s]", r.URL.Path)
+	log.Infof("Http request: [%s]", r.URL.Path)
 
 	proxyInfoResp := GetProxyInfoResp{}
 	proxyInfoResp.Proxies = svr.getProxyStatsByType(proxyType)
+	slices.SortFunc(proxyInfoResp.Proxies, func(a, b *ProxyStatsInfo) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
 
 	buf, _ := json.Marshal(&proxyInfoResp)
 	res.Msg = string(buf)
 }
 
 func (svr *Service) getProxyStatsByType(proxyType string) (proxyInfos []*ProxyStatsInfo) {
-	proxyStats := svr.statsCollector.GetProxiesByType(proxyType)
+	proxyStats := mem.StatsCollector.GetProxiesByType(proxyType)
 	proxyInfos = make([]*ProxyStatsInfo, 0, len(proxyStats))
 	for _, ps := range proxyStats {
 		proxyInfo := &ProxyStatsInfo{}
 		if pxy, ok := svr.pxyManager.GetByName(ps.Name); ok {
-			content, err := json.Marshal(pxy.GetConf())
+			content, err := json.Marshal(pxy.GetConfigurer())
 			if err != nil {
-				log.Warn("marshal proxy [%s] conf info error: %v", ps.Name, err)
+				log.Warnf("marshal proxy [%s] conf info error: %v", ps.Name, err)
 				continue
 			}
 			proxyInfo.Conf = getConfByType(ps.Type)
 			if err = json.Unmarshal(content, &proxyInfo.Conf); err != nil {
-				log.Warn("unmarshal proxy [%s] conf info error: %v", ps.Name, err)
+				log.Warnf("unmarshal proxy [%s] conf info error: %v", ps.Name, err)
 				continue
 			}
-			proxyInfo.Status = consts.Online
+			proxyInfo.Status = "online"
+			if pxy.GetLoginMsg() != nil {
+				proxyInfo.ClientVersion = pxy.GetLoginMsg().Version
+			}
 		} else {
-			proxyInfo.Status = consts.Offline
+			proxyInfo.Status = "offline"
 		}
 		proxyInfo.Name = ps.Name
 		proxyInfo.TodayTrafficIn = ps.TodayTrafficIn
@@ -214,31 +274,31 @@ func (svr *Service) getProxyStatsByType(proxyType string) (proxyInfos []*ProxySt
 type GetProxyStatsResp struct {
 	Name            string      `json:"name"`
 	Conf            interface{} `json:"conf"`
-	TodayTrafficIn  int64       `json:"today_traffic_in"`
-	TodayTrafficOut int64       `json:"today_traffic_out"`
-	CurConns        int64       `json:"cur_conns"`
-	LastStartTime   string      `json:"last_start_time"`
-	LastCloseTime   string      `json:"last_close_time"`
+	TodayTrafficIn  int64       `json:"todayTrafficIn"`
+	TodayTrafficOut int64       `json:"todayTrafficOut"`
+	CurConns        int64       `json:"curConns"`
+	LastStartTime   string      `json:"lastStartTime"`
+	LastCloseTime   string      `json:"lastCloseTime"`
 	Status          string      `json:"status"`
 }
 
-// api/proxy/:type/:name
-func (svr *Service) ApiProxyByTypeAndName(w http.ResponseWriter, r *http.Request) {
+// /api/proxy/:type/:name
+func (svr *Service) apiProxyByTypeAndName(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
 	params := mux.Vars(r)
 	proxyType := params["type"]
 	name := params["name"]
 
 	defer func() {
-		log.Info("Http response [%s]: code [%d]", r.URL.Path, res.Code)
+		log.Infof("Http response [%s]: code [%d]", r.URL.Path, res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
-			w.Write([]byte(res.Msg))
+			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
-	log.Info("Http request: [%s]", r.URL.Path)
+	log.Infof("Http request: [%s]", r.URL.Path)
 
-	proxyStatsResp := GetProxyStatsResp{}
+	var proxyStatsResp GetProxyStatsResp
 	proxyStatsResp, res.Code, res.Msg = svr.getProxyStatsByTypeAndName(proxyType, name)
 	if res.Code != 200 {
 		return
@@ -250,29 +310,29 @@ func (svr *Service) ApiProxyByTypeAndName(w http.ResponseWriter, r *http.Request
 
 func (svr *Service) getProxyStatsByTypeAndName(proxyType string, proxyName string) (proxyInfo GetProxyStatsResp, code int, msg string) {
 	proxyInfo.Name = proxyName
-	ps := svr.statsCollector.GetProxiesByTypeAndName(proxyType, proxyName)
+	ps := mem.StatsCollector.GetProxiesByTypeAndName(proxyType, proxyName)
 	if ps == nil {
 		code = 404
 		msg = "no proxy info found"
 	} else {
 		if pxy, ok := svr.pxyManager.GetByName(proxyName); ok {
-			content, err := json.Marshal(pxy.GetConf())
+			content, err := json.Marshal(pxy.GetConfigurer())
 			if err != nil {
-				log.Warn("marshal proxy [%s] conf info error: %v", ps.Name, err)
+				log.Warnf("marshal proxy [%s] conf info error: %v", ps.Name, err)
 				code = 400
 				msg = "parse conf error"
 				return
 			}
 			proxyInfo.Conf = getConfByType(ps.Type)
 			if err = json.Unmarshal(content, &proxyInfo.Conf); err != nil {
-				log.Warn("unmarshal proxy [%s] conf info error: %v", ps.Name, err)
+				log.Warnf("unmarshal proxy [%s] conf info error: %v", ps.Name, err)
 				code = 400
 				msg = "parse conf error"
 				return
 			}
-			proxyInfo.Status = consts.Online
+			proxyInfo.Status = "online"
 		} else {
-			proxyInfo.Status = consts.Offline
+			proxyInfo.Status = "offline"
 		}
 		proxyInfo.TodayTrafficIn = ps.TodayTrafficIn
 		proxyInfo.TodayTrafficOut = ps.TodayTrafficOut
@@ -285,68 +345,62 @@ func (svr *Service) getProxyStatsByTypeAndName(proxyType string, proxyName strin
 	return
 }
 
-// api/traffic/:name
+// /api/traffic/:name
 type GetProxyTrafficResp struct {
 	Name       string  `json:"name"`
-	TrafficIn  []int64 `json:"traffic_in"`
-	TrafficOut []int64 `json:"traffic_out"`
+	TrafficIn  []int64 `json:"trafficIn"`
+	TrafficOut []int64 `json:"trafficOut"`
 }
 
-func (svr *Service) ApiProxyTraffic(w http.ResponseWriter, r *http.Request) {
+func (svr *Service) apiProxyTraffic(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
 	params := mux.Vars(r)
 	name := params["name"]
 
 	defer func() {
-		log.Info("Http response [%s]: code [%d]", r.URL.Path, res.Code)
+		log.Infof("Http response [%s]: code [%d]", r.URL.Path, res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
-			w.Write([]byte(res.Msg))
+			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
-	log.Info("Http request: [%s]", r.URL.Path)
+	log.Infof("Http request: [%s]", r.URL.Path)
 
 	trafficResp := GetProxyTrafficResp{}
 	trafficResp.Name = name
-	proxyTrafficInfo := svr.statsCollector.GetProxyTraffic(name)
+	proxyTrafficInfo := mem.StatsCollector.GetProxyTraffic(name)
 
 	if proxyTrafficInfo == nil {
 		res.Code = 404
 		res.Msg = "no proxy info found"
 		return
-	} else {
-		trafficResp.TrafficIn = proxyTrafficInfo.TrafficIn
-		trafficResp.TrafficOut = proxyTrafficInfo.TrafficOut
 	}
+	trafficResp.TrafficIn = proxyTrafficInfo.TrafficIn
+	trafficResp.TrafficOut = proxyTrafficInfo.TrafficOut
 
 	buf, _ := json.Marshal(&trafficResp)
 	res.Msg = string(buf)
 }
 
-type CloseUserResp struct {
-	Status int    `json:"status"`
-	Msg    string `json:"message"`
-}
+// DELETE /api/proxies?status=offline
+func (svr *Service) deleteProxies(w http.ResponseWriter, r *http.Request) {
+	res := GeneralResponse{Code: 200}
 
-func (svr *Service) ApiCloseClient(w http.ResponseWriter, r *http.Request) {
-	var (
-		buf  []byte
-		resp = CloseUserResp{}
-	)
-	params := mux.Vars(r)
-	user := params["user"]
+	log.Infof("Http request: [%s]", r.URL.Path)
 	defer func() {
-		log.Info("Http response [/api/client/close/{user}]: code [%d]", resp.Status)
+		log.Infof("Http response [%s]: code [%d]", r.URL.Path, res.Code)
+		w.WriteHeader(res.Code)
+		if len(res.Msg) > 0 {
+			_, _ = w.Write([]byte(res.Msg))
+		}
 	}()
-	log.Info("Http request: [/api/client/close/{user}] %#v", user)
-	err := svr.CloseUser(user)
-	if err != nil {
-		resp.Status = 404
-		resp.Msg = err.Error()
-	} else {
-		resp.Status = 200
-		resp.Msg = "OK"
+
+	status := r.URL.Query().Get("status")
+	if status != "offline" {
+		res.Code = 400
+		res.Msg = "status only support offline"
+		return
 	}
-	buf, _ = json.Marshal(&resp)
-	w.Write(buf)
+	cleared, total := mem.StatsCollector.ClearOfflineProxies()
+	log.Infof("cleared [%d] offline proxies, total [%d] proxies", cleared, total)
 }
