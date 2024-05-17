@@ -3,21 +3,12 @@ package event
 import (
 	"errors"
 
-	"github.com/fatedier/frp/models/msg"
+	"github.com/fatedier/frp/pkg/msg"
 )
 
-type EventType int
+var ErrPayloadType = errors.New("error payload type")
 
-const (
-	EvStartProxy EventType = iota
-	EvCloseProxy
-)
-
-var (
-	ErrPayloadType = errors.New("error payload type")
-)
-
-type EventHandler func(evType EventType, payload interface{}) error
+type Handler func(payload interface{}) error
 
 type StartProxyPayload struct {
 	NewProxyMsg *msg.NewProxy

@@ -16,22 +16,41 @@ package proxy
 
 import (
 	"fmt"
+	"net"
+	"reflect"
+	"strconv"
 
-	"github.com/fatedier/frp/g"
-	"github.com/fatedier/frp/models/config"
-	frpNet "github.com/fatedier/frp/utils/net"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 )
 
-type TcpProxy struct {
-	*BaseProxy
-	cfg *config.TcpProxyConf
-
-	realPort int
+func init() {
+	RegisterProxyFactory(reflect.TypeOf(&v1.TCPProxyConfig{}), NewTCPProxy)
 }
 
-func (pxy *TcpProxy) Run() (remoteAddr string, err error) {
-	if pxy.cfg.Group != "" {
-		l, realPort, errRet := pxy.rc.TcpGroupCtl.Listen(pxy.name, pxy.cfg.Group, pxy.cfg.GroupKey, g.GlbServerCfg.ProxyBindAddr, pxy.cfg.RemotePort)
+type TCPProxy struct {
+	*BaseProxy
+	cfg *v1.TCPProxyConfig
+
+	realBindPort int
+}
+
+func NewTCPProxy(baseProxy *BaseProxy) Proxy {
+	unwrapped, ok := baseProxy.GetConfigurer().(*v1.TCPProxyConfig)
+	if !ok {
+		return nil
+	}
+	baseProxy.usedPortsNum = 1
+	return &TCPProxy{
+		BaseProxy: baseProxy,
+		cfg:       unwrapped,
+	}
+}
+
+func (pxy *TCPProxy) Run() (remoteAddr string, err error) {
+	xl := pxy.xl
+	if pxy.cfg.LoadBalancer.Group != "" {
+		l, realBindPort, errRet := pxy.rc.TCPGroupCtl.Listen(pxy.name, pxy.cfg.LoadBalancer.Group, pxy.cfg.LoadBalancer.GroupKey,
+			pxy.serverCfg.ProxyBindAddr, pxy.cfg.RemotePort)
 		if errRet != nil {
 			err = errRet
 			return
@@ -41,44 +60,37 @@ func (pxy *TcpProxy) Run() (remoteAddr string, err error) {
 				l.Close()
 			}
 		}()
-		pxy.realPort = realPort
-		listener := frpNet.WrapLogListener(l)
-		listener.AddLogPrefix(pxy.name)
-		pxy.listeners = append(pxy.listeners, listener)
-		pxy.Info("tcp proxy listen port [%d] in group [%s]", pxy.cfg.RemotePort, pxy.cfg.Group)
+		pxy.realBindPort = realBindPort
+		pxy.listeners = append(pxy.listeners, l)
+		xl.Infof("tcp proxy listen port [%d] in group [%s]", pxy.cfg.RemotePort, pxy.cfg.LoadBalancer.Group)
 	} else {
-		pxy.realPort, err = pxy.rc.TcpPortManager.Acquire(pxy.name, pxy.cfg.RemotePort)
+		pxy.realBindPort, err = pxy.rc.TCPPortManager.Acquire(pxy.name, pxy.cfg.RemotePort)
 		if err != nil {
 			return
 		}
 		defer func() {
 			if err != nil {
-				pxy.rc.TcpPortManager.Release(pxy.realPort)
+				pxy.rc.TCPPortManager.Release(pxy.realBindPort)
 			}
 		}()
-		listener, errRet := frpNet.ListenTcp(g.GlbServerCfg.ProxyBindAddr, pxy.realPort)
+		listener, errRet := net.Listen("tcp", net.JoinHostPort(pxy.serverCfg.ProxyBindAddr, strconv.Itoa(pxy.realBindPort)))
 		if errRet != nil {
 			err = errRet
 			return
 		}
-		listener.AddLogPrefix(pxy.name)
 		pxy.listeners = append(pxy.listeners, listener)
-		pxy.Info("tcp proxy listen port [%d]", pxy.cfg.RemotePort)
+		xl.Infof("tcp proxy listen port [%d]", pxy.cfg.RemotePort)
 	}
 
-	pxy.cfg.RemotePort = pxy.realPort
-	remoteAddr = fmt.Sprintf(":%d", pxy.realPort)
-	pxy.startListenHandler(pxy, HandleUserTcpConnection)
+	pxy.cfg.RemotePort = pxy.realBindPort
+	remoteAddr = fmt.Sprintf(":%d", pxy.realBindPort)
+	pxy.startCommonTCPListenersHandler()
 	return
 }
 
-func (pxy *TcpProxy) GetConf() config.ProxyConf {
-	return pxy.cfg
-}
-
-func (pxy *TcpProxy) Close() {
+func (pxy *TCPProxy) Close() {
 	pxy.BaseProxy.Close()
-	if pxy.cfg.Group == "" {
-		pxy.rc.TcpPortManager.Release(pxy.realPort)
+	if pxy.cfg.LoadBalancer.Group == "" {
+		pxy.rc.TCPPortManager.Release(pxy.realBindPort)
 	}
 }

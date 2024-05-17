@@ -15,17 +15,23 @@
 package client
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
-	"sort"
-	"strings"
+	"os"
+	"slices"
+	"strconv"
+	"time"
 
 	"github.com/fatedier/frp/client/proxy"
-	"github.com/fatedier/frp/g"
-	"github.com/fatedier/frp/models/config"
-	"github.com/fatedier/frp/utils/log"
+	"github.com/fatedier/frp/pkg/config"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
+	httppkg "github.com/fatedier/frp/pkg/util/http"
+	"github.com/fatedier/frp/pkg/util/log"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
 
 type GeneralResponse struct {
@@ -33,63 +39,92 @@ type GeneralResponse struct {
 	Msg  string
 }
 
-// GET api/reload
+func (svr *Service) registerRouteHandlers(helper *httppkg.RouterRegisterHelper) {
+	helper.Router.HandleFunc("/healthz", svr.healthz)
+	subRouter := helper.Router.NewRoute().Subrouter()
 
+	subRouter.Use(helper.AuthMiddleware.Middleware)
+
+	// api, see admin_api.go
+	subRouter.HandleFunc("/api/reload", svr.apiReload).Methods("GET")
+	subRouter.HandleFunc("/api/stop", svr.apiStop).Methods("POST")
+	subRouter.HandleFunc("/api/status", svr.apiStatus).Methods("GET")
+	subRouter.HandleFunc("/api/config", svr.apiGetConfig).Methods("GET")
+	subRouter.HandleFunc("/api/config", svr.apiPutConfig).Methods("PUT")
+
+	// view
+	subRouter.Handle("/favicon.ico", http.FileServer(helper.AssetsFS)).Methods("GET")
+	subRouter.PathPrefix("/static/").Handler(
+		netpkg.MakeHTTPGzipHandler(http.StripPrefix("/static/", http.FileServer(helper.AssetsFS))),
+	).Methods("GET")
+	subRouter.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/static/", http.StatusMovedPermanently)
+	})
+}
+
+// /healthz
+func (svr *Service) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(200)
+}
+
+// GET /api/reload
 func (svr *Service) apiReload(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
+	strictConfigMode := false
+	strictStr := r.URL.Query().Get("strictConfig")
+	if strictStr != "" {
+		strictConfigMode, _ = strconv.ParseBool(strictStr)
+	}
 
-	log.Info("Http request [/api/reload]")
+	log.Infof("api request [/api/reload]")
 	defer func() {
-		log.Info("Http response [/api/reload], code [%d]", res.Code)
+		log.Infof("api response [/api/reload], code [%d]", res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
-			w.Write([]byte(res.Msg))
+			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
 
-	content, err := config.GetRenderedConfFromFile(g.GlbClientCfg.CfgFile)
+	cliCfg, proxyCfgs, visitorCfgs, _, err := config.LoadClientConfig(svr.configFilePath, strictConfigMode)
 	if err != nil {
 		res.Code = 400
 		res.Msg = err.Error()
-		log.Warn("reload frpc config file error: %s", res.Msg)
+		log.Warnf("reload frpc proxy config error: %s", res.Msg)
 		return
 	}
-
-	newCommonCfg, err := config.UnmarshalClientConfFromIni(nil, content)
-	if err != nil {
+	if _, err := validation.ValidateAllClientConfig(cliCfg, proxyCfgs, visitorCfgs); err != nil {
 		res.Code = 400
 		res.Msg = err.Error()
-		log.Warn("reload frpc common section error: %s", res.Msg)
+		log.Warnf("reload frpc proxy config error: %s", res.Msg)
 		return
 	}
 
-	pxyCfgs, visitorCfgs, err := config.LoadAllConfFromIni(g.GlbClientCfg.User, content, newCommonCfg.Start)
-	if err != nil {
-		res.Code = 400
-		res.Msg = err.Error()
-		log.Warn("reload frpc proxy config error: %s", res.Msg)
-		return
-	}
-
-	err = svr.ReloadConf(pxyCfgs, visitorCfgs)
-	if err != nil {
+	if err := svr.UpdateAllConfigurer(proxyCfgs, visitorCfgs); err != nil {
 		res.Code = 500
 		res.Msg = err.Error()
-		log.Warn("reload frpc proxy config error: %s", res.Msg)
+		log.Warnf("reload frpc proxy config error: %s", res.Msg)
 		return
 	}
-	log.Info("success reload conf")
-	return
+	log.Infof("success reload conf")
 }
 
-type StatusResp struct {
-	Tcp   []ProxyStatusResp `json:"tcp"`
-	Udp   []ProxyStatusResp `json:"udp"`
-	Http  []ProxyStatusResp `json:"http"`
-	Https []ProxyStatusResp `json:"https"`
-	Stcp  []ProxyStatusResp `json:"stcp"`
-	Xtcp  []ProxyStatusResp `json:"xtcp"`
+// POST /api/stop
+func (svr *Service) apiStop(w http.ResponseWriter, _ *http.Request) {
+	res := GeneralResponse{Code: 200}
+
+	log.Infof("api request [/api/stop]")
+	defer func() {
+		log.Infof("api response [/api/stop], code [%d]", res.Code)
+		w.WriteHeader(res.Code)
+		if len(res.Msg) > 0 {
+			_, _ = w.Write([]byte(res.Msg))
+		}
+	}()
+
+	go svr.GracefulClose(100 * time.Millisecond)
 }
+
+type StatusResp map[string][]ProxyStatusResp
 
 type ProxyStatusResp struct {
 	Name       string `json:"name"`
@@ -101,226 +136,127 @@ type ProxyStatusResp struct {
 	RemoteAddr string `json:"remote_addr"`
 }
 
-type ByProxyStatusResp []ProxyStatusResp
-
-func (a ByProxyStatusResp) Len() int           { return len(a) }
-func (a ByProxyStatusResp) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByProxyStatusResp) Less(i, j int) bool { return strings.Compare(a[i].Name, a[j].Name) < 0 }
-
-func NewProxyStatusResp(status *proxy.ProxyStatus) ProxyStatusResp {
+func NewProxyStatusResp(status *proxy.WorkingStatus, serverAddr string) ProxyStatusResp {
 	psr := ProxyStatusResp{
 		Name:   status.Name,
 		Type:   status.Type,
-		Status: status.Status,
+		Status: status.Phase,
 		Err:    status.Err,
 	}
-	switch cfg := status.Cfg.(type) {
-	case *config.TcpProxyConf:
-		if cfg.LocalPort != 0 {
-			psr.LocalAddr = fmt.Sprintf("%s:%d", cfg.LocalIp, cfg.LocalPort)
-		}
-		psr.Plugin = cfg.Plugin
-		if status.Err != "" {
-			psr.RemoteAddr = fmt.Sprintf("%s:%d", g.GlbClientCfg.ServerAddr, cfg.RemotePort)
-		} else {
-			psr.RemoteAddr = g.GlbClientCfg.ServerAddr + status.RemoteAddr
-		}
-	case *config.UdpProxyConf:
-		if cfg.LocalPort != 0 {
-			psr.LocalAddr = fmt.Sprintf("%s:%d", cfg.LocalIp, cfg.LocalPort)
-		}
-		if status.Err != "" {
-			psr.RemoteAddr = fmt.Sprintf("%s:%d", g.GlbClientCfg.ServerAddr, cfg.RemotePort)
-		} else {
-			psr.RemoteAddr = g.GlbClientCfg.ServerAddr + status.RemoteAddr
-		}
-	case *config.HttpProxyConf:
-		if cfg.LocalPort != 0 {
-			psr.LocalAddr = fmt.Sprintf("%s:%d", cfg.LocalIp, cfg.LocalPort)
-		}
-		psr.Plugin = cfg.Plugin
+	baseCfg := status.Cfg.GetBaseConfig()
+	if baseCfg.LocalPort != 0 {
+		psr.LocalAddr = net.JoinHostPort(baseCfg.LocalIP, strconv.Itoa(baseCfg.LocalPort))
+	}
+	psr.Plugin = baseCfg.Plugin.Type
+
+	if status.Err == "" {
 		psr.RemoteAddr = status.RemoteAddr
-	case *config.HttpsProxyConf:
-		if cfg.LocalPort != 0 {
-			psr.LocalAddr = fmt.Sprintf("%s:%d", cfg.LocalIp, cfg.LocalPort)
+		if slices.Contains([]string{"tcp", "udp"}, status.Type) {
+			psr.RemoteAddr = serverAddr + psr.RemoteAddr
 		}
-		psr.Plugin = cfg.Plugin
-		psr.RemoteAddr = status.RemoteAddr
-	case *config.StcpProxyConf:
-		if cfg.LocalPort != 0 {
-			psr.LocalAddr = fmt.Sprintf("%s:%d", cfg.LocalIp, cfg.LocalPort)
-		}
-		psr.Plugin = cfg.Plugin
-	case *config.XtcpProxyConf:
-		if cfg.LocalPort != 0 {
-			psr.LocalAddr = fmt.Sprintf("%s:%d", cfg.LocalIp, cfg.LocalPort)
-		}
-		psr.Plugin = cfg.Plugin
 	}
 	return psr
 }
 
-// GET api/status
-func (svr *Service) apiStatus(w http.ResponseWriter, r *http.Request) {
+// GET /api/status
+func (svr *Service) apiStatus(w http.ResponseWriter, _ *http.Request) {
 	var (
 		buf []byte
-		res StatusResp
+		res StatusResp = make(map[string][]ProxyStatusResp)
 	)
-	res.Tcp = make([]ProxyStatusResp, 0)
-	res.Udp = make([]ProxyStatusResp, 0)
-	res.Http = make([]ProxyStatusResp, 0)
-	res.Https = make([]ProxyStatusResp, 0)
-	res.Stcp = make([]ProxyStatusResp, 0)
-	res.Xtcp = make([]ProxyStatusResp, 0)
 
-	log.Info("Http request [/api/status]")
+	log.Infof("Http request [/api/status]")
 	defer func() {
-		log.Info("Http response [/api/status]")
+		log.Infof("Http response [/api/status]")
 		buf, _ = json.Marshal(&res)
-		w.Write(buf)
+		_, _ = w.Write(buf)
 	}()
 
-	ps := svr.ctl.pm.GetAllProxyStatus()
-	for _, status := range ps {
-		switch status.Type {
-		case "tcp":
-			res.Tcp = append(res.Tcp, NewProxyStatusResp(status))
-		case "udp":
-			res.Udp = append(res.Udp, NewProxyStatusResp(status))
-		case "http":
-			res.Http = append(res.Http, NewProxyStatusResp(status))
-		case "https":
-			res.Https = append(res.Https, NewProxyStatusResp(status))
-		case "stcp":
-			res.Stcp = append(res.Stcp, NewProxyStatusResp(status))
-		case "xtcp":
-			res.Xtcp = append(res.Xtcp, NewProxyStatusResp(status))
-		}
-	}
-	sort.Sort(ByProxyStatusResp(res.Tcp))
-	sort.Sort(ByProxyStatusResp(res.Udp))
-	sort.Sort(ByProxyStatusResp(res.Http))
-	sort.Sort(ByProxyStatusResp(res.Https))
-	sort.Sort(ByProxyStatusResp(res.Stcp))
-	sort.Sort(ByProxyStatusResp(res.Xtcp))
-	return
-}
-
-// GET api/config
-func (svr *Service) apiGetConfig(w http.ResponseWriter, r *http.Request) {
-	res := GeneralResponse{Code: 200}
-
-	log.Info("Http get request [/api/config]")
-	defer func() {
-		log.Info("Http get response [/api/config], code [%d]", res.Code)
-		w.WriteHeader(res.Code)
-		if len(res.Msg) > 0 {
-			w.Write([]byte(res.Msg))
-		}
-	}()
-
-	if g.GlbClientCfg.CfgFile == "" {
-		res.Code = 400
-		res.Msg = "frpc has no config file path"
-		log.Warn("%s", res.Msg)
+	svr.ctlMu.RLock()
+	ctl := svr.ctl
+	svr.ctlMu.RUnlock()
+	if ctl == nil {
 		return
 	}
 
-	content, err := config.GetRenderedConfFromFile(g.GlbClientCfg.CfgFile)
+	ps := ctl.pm.GetAllProxyStatus()
+	for _, status := range ps {
+		res[status.Type] = append(res[status.Type], NewProxyStatusResp(status, svr.common.ServerAddr))
+	}
+
+	for _, arrs := range res {
+		if len(arrs) <= 1 {
+			continue
+		}
+		slices.SortFunc(arrs, func(a, b ProxyStatusResp) int {
+			return cmp.Compare(a.Name, b.Name)
+		})
+	}
+}
+
+// GET /api/config
+func (svr *Service) apiGetConfig(w http.ResponseWriter, _ *http.Request) {
+	res := GeneralResponse{Code: 200}
+
+	log.Infof("Http get request [/api/config]")
+	defer func() {
+		log.Infof("Http get response [/api/config], code [%d]", res.Code)
+		w.WriteHeader(res.Code)
+		if len(res.Msg) > 0 {
+			_, _ = w.Write([]byte(res.Msg))
+		}
+	}()
+
+	if svr.configFilePath == "" {
+		res.Code = 400
+		res.Msg = "frpc has no config file path"
+		log.Warnf("%s", res.Msg)
+		return
+	}
+
+	content, err := os.ReadFile(svr.configFilePath)
 	if err != nil {
 		res.Code = 400
 		res.Msg = err.Error()
-		log.Warn("load frpc config file error: %s", res.Msg)
+		log.Warnf("load frpc config file error: %s", res.Msg)
 		return
 	}
-
-	rows := strings.Split(content, "\n")
-	newRows := make([]string, 0, len(rows))
-	for _, row := range rows {
-		row = strings.TrimSpace(row)
-		if strings.HasPrefix(row, "token") {
-			continue
-		}
-		newRows = append(newRows, row)
-	}
-	res.Msg = strings.Join(newRows, "\n")
+	res.Msg = string(content)
 }
 
-// PUT api/config
+// PUT /api/config
 func (svr *Service) apiPutConfig(w http.ResponseWriter, r *http.Request) {
 	res := GeneralResponse{Code: 200}
 
-	log.Info("Http put request [/api/config]")
+	log.Infof("Http put request [/api/config]")
 	defer func() {
-		log.Info("Http put response [/api/config], code [%d]", res.Code)
+		log.Infof("Http put response [/api/config], code [%d]", res.Code)
 		w.WriteHeader(res.Code)
 		if len(res.Msg) > 0 {
-			w.Write([]byte(res.Msg))
+			_, _ = w.Write([]byte(res.Msg))
 		}
 	}()
 
 	// get new config content
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		res.Code = 400
 		res.Msg = fmt.Sprintf("read request body error: %v", err)
-		log.Warn("%s", res.Msg)
+		log.Warnf("%s", res.Msg)
 		return
 	}
 
 	if len(body) == 0 {
 		res.Code = 400
 		res.Msg = "body can't be empty"
-		log.Warn("%s", res.Msg)
+		log.Warnf("%s", res.Msg)
 		return
 	}
 
-	// get token from origin content
-	token := ""
-	b, err := ioutil.ReadFile(g.GlbClientCfg.CfgFile)
-	if err != nil {
-		res.Code = 400
-		res.Msg = err.Error()
-		log.Warn("load frpc config file error: %s", res.Msg)
-		return
-	}
-	content := string(b)
-
-	for _, row := range strings.Split(content, "\n") {
-		row = strings.TrimSpace(row)
-		if strings.HasPrefix(row, "token") {
-			token = row
-			break
-		}
-	}
-
-	tmpRows := make([]string, 0)
-	for _, row := range strings.Split(string(body), "\n") {
-		row = strings.TrimSpace(row)
-		if strings.HasPrefix(row, "token") {
-			continue
-		}
-		tmpRows = append(tmpRows, row)
-	}
-
-	newRows := make([]string, 0)
-	if token != "" {
-		for _, row := range tmpRows {
-			newRows = append(newRows, row)
-			if strings.HasPrefix(row, "[common]") {
-				newRows = append(newRows, token)
-			}
-		}
-	} else {
-		newRows = tmpRows
-	}
-	content = strings.Join(newRows, "\n")
-
-	err = ioutil.WriteFile(g.GlbClientCfg.CfgFile, []byte(content), 0644)
-	if err != nil {
+	if err := os.WriteFile(svr.configFilePath, body, 0o600); err != nil {
 		res.Code = 500
 		res.Msg = fmt.Sprintf("write content to frpc config file error: %v", err)
-		log.Warn("%s", res.Msg)
+		log.Warnf("%s", res.Msg)
 		return
 	}
 }

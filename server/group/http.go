@@ -2,33 +2,36 @@ package group
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 
-	frpNet "github.com/fatedier/frp/utils/net"
-
-	"github.com/fatedier/frp/utils/vhost"
+	"github.com/fatedier/frp/pkg/util/vhost"
 )
 
 type HTTPGroupController struct {
+	// groups indexed by group name
 	groups map[string]*HTTPGroup
 
-	vhostRouter *vhost.VhostRouters
+	// register createConn for each group to vhostRouter.
+	// createConn will get a connection from one proxy of the group
+	vhostRouter *vhost.Routers
 
 	mu sync.Mutex
 }
 
-func NewHTTPGroupController(vhostRouter *vhost.VhostRouters) *HTTPGroupController {
+func NewHTTPGroupController(vhostRouter *vhost.Routers) *HTTPGroupController {
 	return &HTTPGroupController{
 		groups:      make(map[string]*HTTPGroup),
 		vhostRouter: vhostRouter,
 	}
 }
 
-func (ctl *HTTPGroupController) Register(proxyName, group, groupKey string,
-	routeConfig vhost.VhostRouteConfig) (err error) {
-
-	indexKey := httpGroupIndex(group, routeConfig.Domain, routeConfig.Location)
+func (ctl *HTTPGroupController) Register(
+	proxyName, group, groupKey string,
+	routeConfig vhost.RouteConfig,
+) (err error) {
+	indexKey := group
 	ctl.mu.Lock()
 	g, ok := ctl.groups[indexKey]
 	if !ok {
@@ -40,8 +43,8 @@ func (ctl *HTTPGroupController) Register(proxyName, group, groupKey string,
 	return g.Register(proxyName, group, groupKey, routeConfig)
 }
 
-func (ctl *HTTPGroupController) UnRegister(proxyName, group, domain, location string) {
-	indexKey := httpGroupIndex(group, domain, location)
+func (ctl *HTTPGroupController) UnRegister(proxyName, group string, _ vhost.RouteConfig) {
+	indexKey := group
 	ctl.mu.Lock()
 	defer ctl.mu.Unlock()
 	g, ok := ctl.groups[indexKey]
@@ -56,11 +59,13 @@ func (ctl *HTTPGroupController) UnRegister(proxyName, group, domain, location st
 }
 
 type HTTPGroup struct {
-	group    string
-	groupKey string
-	domain   string
-	location string
+	group           string
+	groupKey        string
+	domain          string
+	location        string
+	routeByHTTPUser string
 
+	// CreateConnFuncs indexed by proxy name
 	createFuncs map[string]vhost.CreateConnFunc
 	pxyNames    []string
 	index       uint64
@@ -76,16 +81,19 @@ func NewHTTPGroup(ctl *HTTPGroupController) *HTTPGroup {
 	}
 }
 
-func (g *HTTPGroup) Register(proxyName, group, groupKey string,
-	routeConfig vhost.VhostRouteConfig) (err error) {
-
+func (g *HTTPGroup) Register(
+	proxyName, group, groupKey string,
+	routeConfig vhost.RouteConfig,
+) (err error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if len(g.createFuncs) == 0 {
 		// the first proxy in this group
 		tmp := routeConfig // copy object
 		tmp.CreateConnFn = g.createConn
-		err = g.ctl.vhostRouter.Add(routeConfig.Domain, routeConfig.Location, &tmp)
+		tmp.ChooseEndpointFn = g.chooseEndpoint
+		tmp.CreateConnByEndpointFn = g.createConnByEndpoint
+		err = g.ctl.vhostRouter.Add(routeConfig.Domain, routeConfig.Location, routeConfig.RouteByHTTPUser, &tmp)
 		if err != nil {
 			return
 		}
@@ -94,8 +102,10 @@ func (g *HTTPGroup) Register(proxyName, group, groupKey string,
 		g.groupKey = groupKey
 		g.domain = routeConfig.Domain
 		g.location = routeConfig.Location
+		g.routeByHTTPUser = routeConfig.RouteByHTTPUser
 	} else {
-		if g.group != group || g.domain != routeConfig.Domain || g.location != routeConfig.Location {
+		if g.group != group || g.domain != routeConfig.Domain ||
+			g.location != routeConfig.Location || g.routeByHTTPUser != routeConfig.RouteByHTTPUser {
 			err = ErrGroupParamsInvalid
 			return
 		}
@@ -126,12 +136,12 @@ func (g *HTTPGroup) UnRegister(proxyName string) (isEmpty bool) {
 
 	if len(g.createFuncs) == 0 {
 		isEmpty = true
-		g.ctl.vhostRouter.Del(g.domain, g.location)
+		g.ctl.vhostRouter.Del(g.domain, g.location, g.routeByHTTPUser)
 	}
 	return
 }
 
-func (g *HTTPGroup) createConn(remoteAddr string) (frpNet.Conn, error) {
+func (g *HTTPGroup) createConn(remoteAddr string) (net.Conn, error) {
 	var f vhost.CreateConnFunc
 	newIndex := atomic.AddUint64(&g.index, 1)
 
@@ -139,19 +149,50 @@ func (g *HTTPGroup) createConn(remoteAddr string) (frpNet.Conn, error) {
 	group := g.group
 	domain := g.domain
 	location := g.location
+	routeByHTTPUser := g.routeByHTTPUser
 	if len(g.pxyNames) > 0 {
 		name := g.pxyNames[int(newIndex)%len(g.pxyNames)]
-		f, _ = g.createFuncs[name]
+		f = g.createFuncs[name]
 	}
 	g.mu.RUnlock()
 
 	if f == nil {
-		return nil, fmt.Errorf("no CreateConnFunc for http group [%s], domain [%s], location [%s]", group, domain, location)
+		return nil, fmt.Errorf("no CreateConnFunc for http group [%s], domain [%s], location [%s], routeByHTTPUser [%s]",
+			group, domain, location, routeByHTTPUser)
 	}
 
 	return f(remoteAddr)
 }
 
-func httpGroupIndex(group, domain, location string) string {
-	return fmt.Sprintf("%s_%s_%s", group, domain, location)
+func (g *HTTPGroup) chooseEndpoint() (string, error) {
+	newIndex := atomic.AddUint64(&g.index, 1)
+	name := ""
+
+	g.mu.RLock()
+	group := g.group
+	domain := g.domain
+	location := g.location
+	routeByHTTPUser := g.routeByHTTPUser
+	if len(g.pxyNames) > 0 {
+		name = g.pxyNames[int(newIndex)%len(g.pxyNames)]
+	}
+	g.mu.RUnlock()
+
+	if name == "" {
+		return "", fmt.Errorf("no healthy endpoint for http group [%s], domain [%s], location [%s], routeByHTTPUser [%s]",
+			group, domain, location, routeByHTTPUser)
+	}
+	return name, nil
+}
+
+func (g *HTTPGroup) createConnByEndpoint(endpoint, remoteAddr string) (net.Conn, error) {
+	var f vhost.CreateConnFunc
+	g.mu.RLock()
+	f = g.createFuncs[endpoint]
+	g.mu.RUnlock()
+
+	if f == nil {
+		return nil, fmt.Errorf("no CreateConnFunc for endpoint [%s] in group [%s]", endpoint, g.group)
+	}
+	return f(remoteAddr)
 }

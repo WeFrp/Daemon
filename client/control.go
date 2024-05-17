@@ -15,304 +15,276 @@
 package client
 
 import (
-	"crypto/tls"
-	"fmt"
-	"io"
-	"runtime/debug"
-	"sync"
+	"context"
+	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatedier/frp/client/proxy"
-	"github.com/fatedier/frp/g"
-	"github.com/fatedier/frp/models/config"
-	"github.com/fatedier/frp/models/msg"
-	"github.com/fatedier/frp/utils/log"
-	frpNet "github.com/fatedier/frp/utils/net"
-
-	"github.com/fatedier/golib/control/shutdown"
-	"github.com/fatedier/golib/crypto"
-	fmux "github.com/hashicorp/yamux"
+	"github.com/fatedier/frp/client/visitor"
+	"github.com/fatedier/frp/pkg/auth"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/msg"
+	"github.com/fatedier/frp/pkg/transport"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
+	"github.com/fatedier/frp/pkg/util/wait"
+	"github.com/fatedier/frp/pkg/util/xlog"
 )
 
+type SessionContext struct {
+	// The client common configuration.
+	Common *v1.ClientCommonConfig
+
+	// Unique ID obtained from frps.
+	// It should be attached to the login message when reconnecting.
+	RunID string
+	// Underlying control connection. Once conn is closed, the msgDispatcher and the entire Control will exit.
+	Conn net.Conn
+	// Indicates whether the connection is encrypted.
+	ConnEncrypted bool
+	// Sets authentication based on selected method
+	AuthSetter auth.Setter
+	// Connector is used to create new connections, which could be real TCP connections or virtual streams.
+	Connector Connector
+}
+
 type Control struct {
-	// uniq id got from frps, attach it in loginMsg
-	runId string
+	// service context
+	ctx context.Context
+	xl  *xlog.Logger
+
+	// session context
+	sessionCtx *SessionContext
 
 	// manage all proxies
-	pxyCfgs map[string]config.ProxyConf
-	pm      *proxy.ProxyManager
+	pm *proxy.Manager
 
 	// manage all visitors
-	vm *VisitorManager
+	vm *visitor.Manager
 
-	// control connection
-	conn frpNet.Conn
+	doneCh chan struct{}
 
-	// tcp stream multiplexing, if enabled
-	session *fmux.Session
+	// of time.Time, last time got the Pong message
+	lastPong atomic.Value
 
-	// put a message in this channel to send it over control connection to server
-	sendCh chan (msg.Message)
+	// The role of msgTransporter is similar to HTTP2.
+	// It allows multiple messages to be sent simultaneously on the same control connection.
+	// The server's response messages will be dispatched to the corresponding waiting goroutines based on the laneKey and message type.
+	msgTransporter transport.MessageTransporter
 
-	// read from this channel to get the next message sent by server
-	readCh chan (msg.Message)
-
-	// goroutines can block by reading from this channel, it will be closed only in reader() when control connection is closed
-	closedCh chan struct{}
-
-	closedDoneCh chan struct{}
-
-	// last time got the Pong message
-	lastPong time.Time
-
-	readerShutdown     *shutdown.Shutdown
-	writerShutdown     *shutdown.Shutdown
-	msgHandlerShutdown *shutdown.Shutdown
-
-	mu sync.RWMutex
-
-	log.Logger
+	// msgDispatcher is a wrapper for control connection.
+	// It provides a channel for sending messages, and you can register handlers to process messages based on their respective types.
+	msgDispatcher *msg.Dispatcher
 }
 
-func NewControl(runId string, conn frpNet.Conn, session *fmux.Session, pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.VisitorConf) *Control {
+func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, error) {
+	// new xlog instance
 	ctl := &Control{
-		runId:              runId,
-		conn:               conn,
-		session:            session,
-		pxyCfgs:            pxyCfgs,
-		sendCh:             make(chan msg.Message, 100),
-		readCh:             make(chan msg.Message, 100),
-		closedCh:           make(chan struct{}),
-		closedDoneCh:       make(chan struct{}),
-		readerShutdown:     shutdown.New(),
-		writerShutdown:     shutdown.New(),
-		msgHandlerShutdown: shutdown.New(),
-		Logger:             log.NewPrefixLogger(""),
+		ctx:        ctx,
+		xl:         xlog.FromContextSafe(ctx),
+		sessionCtx: sessionCtx,
+		doneCh:     make(chan struct{}),
 	}
-	ctl.pm = proxy.NewProxyManager(ctl.sendCh, runId)
+	ctl.lastPong.Store(time.Now())
 
-	ctl.vm = NewVisitorManager(ctl)
-	ctl.vm.Reload(visitorCfgs)
-	return ctl
+	if sessionCtx.ConnEncrypted {
+		cryptoRW, err := netpkg.NewCryptoReadWriter(sessionCtx.Conn, []byte(sessionCtx.Common.Auth.Token))
+		if err != nil {
+			return nil, err
+		}
+		ctl.msgDispatcher = msg.NewDispatcher(cryptoRW)
+	} else {
+		ctl.msgDispatcher = msg.NewDispatcher(sessionCtx.Conn)
+	}
+	ctl.registerMsgHandlers()
+	ctl.msgTransporter = transport.NewMessageTransporter(ctl.msgDispatcher.SendChannel())
+
+	ctl.pm = proxy.NewManager(ctl.ctx, sessionCtx.Common, ctl.msgTransporter)
+	ctl.vm = visitor.NewManager(ctl.ctx, sessionCtx.RunID, sessionCtx.Common, ctl.connectServer, ctl.msgTransporter)
+	return ctl, nil
 }
 
-func (ctl *Control) Run() {
+func (ctl *Control) Run(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) {
 	go ctl.worker()
 
 	// start all proxies
-	ctl.pm.Reload(ctl.pxyCfgs)
+	ctl.pm.UpdateAll(proxyCfgs)
 
 	// start all visitors
-	go ctl.vm.Run()
-	return
+	ctl.vm.UpdateAll(visitorCfgs)
 }
 
-func (ctl *Control) HandleReqWorkConn(inMsg *msg.ReqWorkConn) {
+func (ctl *Control) SetInWorkConnCallback(cb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool) {
+	ctl.pm.SetInWorkConnCallback(cb)
+}
+
+func (ctl *Control) handleReqWorkConn(_ msg.Message) {
+	xl := ctl.xl
 	workConn, err := ctl.connectServer()
 	if err != nil {
+		xl.Warnf("start new connection to server error: %v", err)
 		return
 	}
 
 	m := &msg.NewWorkConn{
-		RunId: ctl.runId,
+		RunID: ctl.sessionCtx.RunID,
+	}
+	if err = ctl.sessionCtx.AuthSetter.SetNewWorkConn(m); err != nil {
+		xl.Warnf("error during NewWorkConn authentication: %v", err)
+		workConn.Close()
+		return
 	}
 	if err = msg.WriteMsg(workConn, m); err != nil {
-		ctl.Warn("work connection write to server error: %v", err)
+		xl.Warnf("work connection write to server error: %v", err)
 		workConn.Close()
 		return
 	}
 
 	var startMsg msg.StartWorkConn
 	if err = msg.ReadMsgInto(workConn, &startMsg); err != nil {
-		ctl.Error("work connection closed, %v", err)
+		xl.Tracef("work connection closed before response StartWorkConn message: %v", err)
 		workConn.Close()
 		return
 	}
-	workConn.AddLogPrefix(startMsg.ProxyName)
+	if startMsg.Error != "" {
+		xl.Errorf("StartWorkConn contains error: %s", startMsg.Error)
+		workConn.Close()
+		return
+	}
 
 	// dispatch this work connection to related proxy
 	ctl.pm.HandleWorkConn(startMsg.ProxyName, workConn, &startMsg)
 }
 
-func (ctl *Control) HandleNewProxyResp(inMsg *msg.NewProxyResp) {
+func (ctl *Control) handleNewProxyResp(m msg.Message) {
+	xl := ctl.xl
+	inMsg := m.(*msg.NewProxyResp)
 	// Server will return NewProxyResp message to each NewProxy message.
 	// Start a new proxy handler if no error got
 	err := ctl.pm.StartProxy(inMsg.ProxyName, inMsg.RemoteAddr, inMsg.Error)
 	if err != nil {
-		ctl.Warn("[%s] start error: %v", inMsg.ProxyName, err)
+		xl.Warnf("[%s] start error: %v", inMsg.ProxyName, err)
 	} else {
-		ctl.Info("[%s] start proxy success", inMsg.ProxyName)
+		xl.Infof("[%s] start proxy success", inMsg.ProxyName)
 	}
+}
+
+func (ctl *Control) handleNatHoleResp(m msg.Message) {
+	xl := ctl.xl
+	inMsg := m.(*msg.NatHoleResp)
+
+	// Dispatch the NatHoleResp message to the related proxy.
+	ok := ctl.msgTransporter.DispatchWithType(inMsg, msg.TypeNameNatHoleResp, inMsg.TransactionID)
+	if !ok {
+		xl.Tracef("dispatch NatHoleResp message to related proxy error")
+	}
+}
+
+func (ctl *Control) handlePong(m msg.Message) {
+	xl := ctl.xl
+	inMsg := m.(*msg.Pong)
+
+	if inMsg.Error != "" {
+		xl.Errorf("Pong message contains error: %s", inMsg.Error)
+		ctl.closeSession()
+		return
+	}
+	ctl.lastPong.Store(time.Now())
+	xl.Debugf("receive heartbeat from server")
+}
+
+// closeSession closes the control connection.
+func (ctl *Control) closeSession() {
+	ctl.sessionCtx.Conn.Close()
+	ctl.sessionCtx.Connector.Close()
 }
 
 func (ctl *Control) Close() error {
+	return ctl.GracefulClose(0)
+}
+
+func (ctl *Control) GracefulClose(d time.Duration) error {
 	ctl.pm.Close()
-	ctl.conn.Close()
-	if ctl.session != nil {
-		ctl.session.Close()
-	}
+	ctl.vm.Close()
+
+	time.Sleep(d)
+
+	ctl.closeSession()
 	return nil
 }
 
-// ClosedDoneCh returns a channel which will be closed after all resources are released
-func (ctl *Control) ClosedDoneCh() <-chan struct{} {
-	return ctl.closedDoneCh
+// Done returns a channel that will be closed after all resources are released
+func (ctl *Control) Done() <-chan struct{} {
+	return ctl.doneCh
 }
 
 // connectServer return a new connection to frps
-func (ctl *Control) connectServer() (conn frpNet.Conn, err error) {
-	if g.GlbClientCfg.TcpMux {
-		stream, errRet := ctl.session.OpenStream()
-		if errRet != nil {
-			err = errRet
-			ctl.Warn("start new connection to server error: %v", err)
-			return
-		}
-		conn = frpNet.WrapConn(stream)
-	} else {
-		var tlsConfig *tls.Config
-		if g.GlbClientCfg.TLSEnable {
-			tlsConfig = &tls.Config{
-				InsecureSkipVerify: true,
-			}
-		}
-		conn, err = frpNet.ConnectServerByProxyWithTLS(g.GlbClientCfg.HttpProxy, g.GlbClientCfg.Protocol,
-			fmt.Sprintf("%s:%d", g.GlbClientCfg.ServerAddr, g.GlbClientCfg.ServerPort), tlsConfig)
-		if err != nil {
-			ctl.Warn("start new connection to server error: %v", err)
-			return
-		}
-	}
-	return
+func (ctl *Control) connectServer() (net.Conn, error) {
+	return ctl.sessionCtx.Connector.Connect()
 }
 
-// reader read all messages from frps and send to readCh
-func (ctl *Control) reader() {
-	defer func() {
-		if err := recover(); err != nil {
-			ctl.Error("panic error: %v", err)
-			ctl.Error(string(debug.Stack()))
-		}
-	}()
-	defer ctl.readerShutdown.Done()
-	defer close(ctl.closedCh)
-
-	encReader := crypto.NewReader(ctl.conn, []byte(g.GlbClientCfg.Token))
-	for {
-		if m, err := msg.ReadMsg(encReader); err != nil {
-			if err == io.EOF {
-				ctl.Debug("read from control connection EOF")
-				return
-			} else {
-				ctl.Warn("read error: %v", err)
-				ctl.conn.Close()
-				return
-			}
-		} else {
-			ctl.readCh <- m
-		}
-	}
+func (ctl *Control) registerMsgHandlers() {
+	ctl.msgDispatcher.RegisterHandler(&msg.ReqWorkConn{}, msg.AsyncHandler(ctl.handleReqWorkConn))
+	ctl.msgDispatcher.RegisterHandler(&msg.NewProxyResp{}, ctl.handleNewProxyResp)
+	ctl.msgDispatcher.RegisterHandler(&msg.NatHoleResp{}, ctl.handleNatHoleResp)
+	ctl.msgDispatcher.RegisterHandler(&msg.Pong{}, ctl.handlePong)
 }
 
-// writer writes messages got from sendCh to frps
-func (ctl *Control) writer() {
-	defer ctl.writerShutdown.Done()
-	encWriter, err := crypto.NewWriter(ctl.conn, []byte(g.GlbClientCfg.Token))
-	if err != nil {
-		ctl.conn.Error("crypto new writer error: %v", err)
-		ctl.conn.Close()
-		return
+// headerWorker sends heartbeat to server and check heartbeat timeout.
+func (ctl *Control) heartbeatWorker() {
+	xl := ctl.xl
+
+	if ctl.sessionCtx.Common.Transport.HeartbeatInterval > 0 {
+		// Send heartbeat to server.
+		sendHeartBeat := func() (bool, error) {
+			xl.Debugf("send heartbeat to server")
+			pingMsg := &msg.Ping{}
+			if err := ctl.sessionCtx.AuthSetter.SetPing(pingMsg); err != nil {
+				xl.Warnf("error during ping authentication: %v, skip sending ping message", err)
+				return false, err
+			}
+			_ = ctl.msgDispatcher.Send(pingMsg)
+			return false, nil
+		}
+
+		go wait.BackoffUntil(sendHeartBeat,
+			wait.NewFastBackoffManager(wait.FastBackoffOptions{
+				Duration:           time.Duration(ctl.sessionCtx.Common.Transport.HeartbeatInterval) * time.Second,
+				InitDurationIfFail: time.Second,
+				Factor:             2.0,
+				Jitter:             0.1,
+				MaxDuration:        time.Duration(ctl.sessionCtx.Common.Transport.HeartbeatInterval) * time.Second,
+			}),
+			true, ctl.doneCh,
+		)
 	}
-	for {
-		if m, ok := <-ctl.sendCh; !ok {
-			ctl.Info("control writer is closing")
-			return
-		} else {
-			if err := msg.WriteMsg(encWriter, m); err != nil {
-				ctl.Warn("write message to control connection error: %v", err)
+
+	// Check heartbeat timeout.
+	if ctl.sessionCtx.Common.Transport.HeartbeatInterval > 0 && ctl.sessionCtx.Common.Transport.HeartbeatTimeout > 0 {
+		go wait.Until(func() {
+			if time.Since(ctl.lastPong.Load().(time.Time)) > time.Duration(ctl.sessionCtx.Common.Transport.HeartbeatTimeout)*time.Second {
+				xl.Warnf("heartbeat timeout")
+				ctl.closeSession()
 				return
 			}
-		}
+		}, time.Second, ctl.doneCh)
 	}
 }
 
-// msgHandler handles all channel events and do corresponding operations.
-func (ctl *Control) msgHandler() {
-	defer func() {
-		if err := recover(); err != nil {
-			ctl.Error("panic error: %v", err)
-			ctl.Error(string(debug.Stack()))
-		}
-	}()
-	defer ctl.msgHandlerShutdown.Done()
-
-	hbSend := time.NewTicker(time.Duration(g.GlbClientCfg.HeartBeatInterval) * time.Second)
-	defer hbSend.Stop()
-	hbCheck := time.NewTicker(time.Second)
-	defer hbCheck.Stop()
-
-	ctl.lastPong = time.Now()
-
-	for {
-		select {
-		case <-hbSend.C:
-			// send heartbeat to server
-			ctl.Debug("send heartbeat to server")
-			ctl.sendCh <- &msg.Ping{}
-		case <-hbCheck.C:
-			if time.Since(ctl.lastPong) > time.Duration(g.GlbClientCfg.HeartBeatTimeout)*time.Second {
-				ctl.Warn("heartbeat timeout")
-				// let reader() stop
-				ctl.conn.Close()
-				return
-			}
-		case rawMsg, ok := <-ctl.readCh:
-			if !ok {
-				return
-			}
-
-			switch m := rawMsg.(type) {
-			case *msg.ReqWorkConn:
-				go ctl.HandleReqWorkConn(m)
-			case *msg.NewProxyResp:
-				ctl.HandleNewProxyResp(m)
-			case *msg.Pong:
-				ctl.lastPong = time.Now()
-				ctl.Debug("receive heartbeat from server")
-			}
-		}
-	}
-}
-
-// If controler is notified by closedCh, reader and writer and handler will exit
 func (ctl *Control) worker() {
-	go ctl.msgHandler()
-	go ctl.reader()
-	go ctl.writer()
+	go ctl.heartbeatWorker()
+	go ctl.msgDispatcher.Run()
 
-	select {
-	case <-ctl.closedCh:
-		// close related channels and wait until other goroutines done
-		close(ctl.readCh)
-		ctl.readerShutdown.WaitDone()
-		ctl.msgHandlerShutdown.WaitDone()
+	<-ctl.msgDispatcher.Done()
+	ctl.closeSession()
 
-		close(ctl.sendCh)
-		ctl.writerShutdown.WaitDone()
-
-		ctl.pm.Close()
-		ctl.vm.Close()
-
-		close(ctl.closedDoneCh)
-		if ctl.session != nil {
-			ctl.session.Close()
-		}
-		return
-	}
+	ctl.pm.Close()
+	ctl.vm.Close()
+	close(ctl.doneCh)
 }
 
-func (ctl *Control) ReloadConf(pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.VisitorConf) error {
-	ctl.vm.Reload(visitorCfgs)
-	ctl.pm.Reload(pxyCfgs)
+func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
+	ctl.vm.UpdateAll(visitorCfgs)
+	ctl.pm.UpdateAll(proxyCfgs)
 	return nil
 }
